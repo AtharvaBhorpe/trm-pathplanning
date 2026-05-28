@@ -1,0 +1,43 @@
+# Main TRM config — tuned for RTX 5060 Mobile (8 GB VRAM)
+experiment_name: trm_base
+seed: 42
+
+data:
+  grid_size: 26
+  obstacle_density: 0.25
+  num_train: 40000
+  num_val: 5000
+  num_test: 10000
+  data_dir: data/grids_26x26_d25
+  num_workers: 4
+
+model:
+  arch: trm                # trm | cnn
+  dim: 128
+  num_heads: 8
+  num_layers: 2
+  num_classes: 5           # N, S, E, W, stay
+  T: 3                     # supervision steps (deep supervision)
+  n: 6                     # recursion iterations per supervision step
+  halting: true
+
+training:
+  batch_size: 16
+  grad_accum_steps: 4      # effective batch size = 64
+  num_epochs: 40
+  lr: 1.0e-3
+  weight_decay: 0.01
+  grad_clip: 1.0
+  mixed_precision: bf16    # bf16 | fp16 | none
+  gradient_checkpointing: false   # enable only if you OOM
+  ema_decay: 0.999
+  use_ema: true
+  halt_loss_weight: 1.0
+  early_stopping_patience: 10
+
+logging:
+  log_dir: logs/trm_base
+  checkpoint_dir: checkpoints/trm_base
+  log_every_n_steps: 50
+  eval_every_n_epochs: 1
+  rerun_viz: true          # log predicted-vs-optimal path each eval
