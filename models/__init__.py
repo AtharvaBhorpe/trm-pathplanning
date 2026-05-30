@@ -1,2 +1,2 @@
-"""TRM architecture (layers, embeddings, model) and CNN baseline."""
+"""TRM architecture (layers, attention, embeddings, model) and CNN baseline."""
 

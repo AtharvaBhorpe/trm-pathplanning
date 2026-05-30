@@ -1,7 +1,10 @@
 """
-Main training entry. Config-driven so every experiment is one YAML diff.
+Train a TRM (or the CNN baseline) to predict the optimal action at every cell.
 
-    uv run python pretrain.py --config configs/base.yaml
+Run:  uv run python pretrain.py --config configs/base.yaml
+
+Each epoch: train over the data, evaluate on the validation split, and save the
+best checkpoint (by path success rate) to the config's checkpoint_dir.
 """
 
 import argparse
@@ -12,76 +15,41 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 import yaml
+from torch.amp import autocast
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
 
 from dataset.loader import make_loader
-from models.trm import TinyRecursiveModel
 from models import cnn_baseline
+from models.trm import TinyRecursiveModel
+from utils import metrics as M
+from utils import rerun_viz
 from utils.ema import EMA
 from utils.logging import CSVLogger
-from utils import metrics as M
 
-IGNORE_INDEX = -100
+IGNORE_INDEX = -100  # cells the loss skips (obstacles / unreachable)
 
-def compute_trm_loss(output: dict, targets: torch.LongTensor, halt_weight=1.0) -> dict:
-    """
-    Deep-supervision loss = sum over T supervision steps of
-        (per-cell cross-entropy) + halt_weight * (halting BCE).
 
-    Args:
-        output: dict from the model with 'logits' (list of T tensors (B,L,C))
-                and 'halt_probs' (list of T tensors (B,1), possibly empty).
-        targets: LongTensor (B, L) of action ids; masked cells == IGNORE_INDEX.
-        halt_weight: lambda on the halting term.
-
-    Returns:
-        dict with 'total_loss' (scalar tensor) and 'final_acc' (float, for logging).
-
-    Steps (TODO):
-      for each step t:
-        ce_t = F.cross_entropy(logits[t].reshape(-1, C), targets.reshape(-1),
-                               ignore_index=IGNORE_INDEX)
-        if halting:
-            # q = 1 if this step's per-cell prediction is "correct enough", else 0.
-            # A reasonable target: per-sample fraction of correct non-masked cells
-            # thresholded, OR just the mean per-cell correctness. Detach it.
-            # halt_bce = F.binary_cross_entropy(halt_probs[t].squeeze(-1), q)
-            ...
-        step_loss = ce_t + halt_weight * halt_bce
-      total = sum(step_loss)
-    """
-    total_loss = 0.0
-    for t, logits in enumerate(output['logits']):
-        ce_t = F.cross_entropy(logits[t].reshape(-1, logits[t].shape[-1]), targets.reshape(-1),
-                               ignore_index=IGNORE_INDEX)
-        if 'halt_probs' in output and len(output['halt_probs']) > t:
-            halt_prob = output['halt_probs'][t].squeeze(-1)  # (B,)
-            with torch.no_grad():
-                pred_actions = logits[t].argmax(dim=-1)  # (B, L)
-                correct = (pred_actions == targets) & (targets != IGNORE_INDEX)  # (B, L)
-                q = correct.float().mean(dim=1)  # (B,) fraction of correct non-masked cells
-            halt_bce = F.binary_cross_entropy(halt_prob, q)
-        else:
-            halt_bce = 0.0
-        step_loss = ce_t + halt_weight * halt_bce
-        total_loss += step_loss
-    return {
-        'total_loss': total_loss,
-        'final_acc': M.per_cell_accuracy(output['logits'][-1].argmax(dim=-1), targets, IGNORE_INDEX)
-    }
-
-def set_seed(s):
-    random.seed(s); np.random.seed(s); torch.manual_seed(s); torch.cuda.manual_seed_all(s)
+def set_seed(seed):
+    """Make a run reproducible across python, numpy and torch."""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
 
 
 def build_model(cfg, device):
+    """Create the model named in the config ('trm' or 'cnn') and move it to device."""
     m = cfg["model"]
     if m["arch"] == "trm":
         model = TinyRecursiveModel(
-            dim=m["dim"], num_heads=m["num_heads"], num_layers=m["num_layers"],
-            num_classes=m["num_classes"], grid_size=cfg["data"]["grid_size"],
-            T=m["T"], n=m["n"], halting=m["halting"],
+            dim=m["dim"],
+            num_heads=m["num_heads"],
+            num_layers=m["num_layers"],
+            num_classes=m["num_classes"],
+            grid_size=cfg["data"]["grid_size"],
+            T=m["T"],
+            n=m["n"],
+            halting=m["halting"],
         )
     else:
         m["grid_size"] = cfg["data"]["grid_size"]
@@ -89,90 +57,201 @@ def build_model(cfg, device):
     return model.to(device)
 
 
+def compute_loss(output, targets, halt_weight=1.0, deep_supervision=True):
+    """
+    Loss = per-cell cross-entropy, summed over the model's T supervision steps,
+    plus an optional halting term.
+
+    output: dict from the model; 'logits' is a list of T (B, L, C) tensors.
+    targets: (B, L) correct action ids; masked cells hold IGNORE_INDEX.
+    deep_supervision: if False, only the final step is supervised.
+
+    Returns {'total_loss': tensor, 'final_acc': float (for logging)}.
+    """
+    steps = range(len(output["logits"])) if deep_supervision else [-1]
+    total = 0.0
+    for t in steps:
+        logits = output["logits"][t]
+        # main objective: the right action at every non-masked cell
+        total = total + F.cross_entropy(
+            logits.reshape(-1, logits.shape[-1]),
+            targets.reshape(-1),
+            ignore_index=IGNORE_INDEX,
+        )
+        # optional halt head: predict the fraction of cells already correct
+        if output["halt_probs"]:
+            halt_prob = output["halt_probs"][t].squeeze(-1)  # (B,)
+            with torch.no_grad():
+                correct = (logits.argmax(-1) == targets) & (targets != IGNORE_INDEX)
+                done_fraction = correct.float().mean(dim=1)  # (B,)
+            total = total + halt_weight * F.binary_cross_entropy_with_logits(
+                halt_prob.float(), done_fraction
+            )
+
+    final_acc = M.per_cell_accuracy(
+        output["logits"][-1].argmax(-1), targets, IGNORE_INDEX
+    )
+    return {"total_loss": total, "final_acc": final_acc}
+
+
 @torch.no_grad()
 def evaluate(model, loader, size, device):
+    """
+    Run the model over a data split and aggregate metrics over the WHOLE split
+    (not per-batch averages, which are biased when batches differ in size):
+        success_rate     : fraction of grids whose predicted path reaches the goal
+        optimality_ratio : path length / shortest length, over successful grids
+        per_cell_acc     : fraction of cells with the correct action
+    """
     model.eval()
-    agg = {"success_rate": [], "optimality_ratio": [], "per_cell_acc": []}
+    total_n, total_success = 0, 0
+    opt_ratios = []
+    cell_correct, cell_total = 0, 0
     for grids, targets in loader:
         grids = grids.to(device)
-        out = model(grids)
-        preds = out["final_logits"].argmax(dim=-1)            # (B, L)
-        # recover flattened start/goal from the marker tokens in the input
+        preds = model(grids)["final_logits"].argmax(dim=-1).cpu()  # (B, L)
+        # recover start/goal from the marker tokens in the input
         starts = (grids == 2).float().argmax(dim=1).cpu().numpy()
         goals = (grids == 3).float().argmax(dim=1).cpu().numpy()
+
         b = M.evaluate_batch(grids, preds, starts, goals, size)
-        agg["success_rate"].append(b["success_rate"])
-        agg["optimality_ratio"].append(b["optimality_ratio"])
-        agg["per_cell_acc"].append(M.per_cell_accuracy(preds.cpu(), targets, IGNORE_INDEX))
-    return {k: float(np.mean(v)) for k, v in agg.items()}
+        total_n += b["n"]
+        total_success += b["successes"]
+        opt_ratios.extend(b["opt_ratios"])
+
+        mask = targets != IGNORE_INDEX
+        cell_correct += (preds[mask] == targets[mask]).sum().item()
+        cell_total += int(mask.sum().item())
+
+    return {
+        "success_rate": total_success / max(total_n, 1),
+        "optimality_ratio": float(np.mean(opt_ratios)) if opt_ratios else 0.0,
+        "per_cell_acc": cell_correct / max(cell_total, 1),
+    }
+
+
+@torch.no_grad()
+def _log_viz_epoch(model, viz_samples, epoch, device, size):
+    """Log predicted vs optimal paths for a fixed set of val samples (Phase 4)."""
+    model.eval()
+    for j, s in enumerate(viz_samples):
+        x = torch.tensor(s["grid_tokens"], dtype=torch.long, device=device).unsqueeze(0)
+        pred = (
+            model(x)["final_logits"]
+            .argmax(dim=-1)
+            .squeeze(0)
+            .cpu()
+            .numpy()
+            .reshape(size, size)
+        )
+        rerun_viz.log_sample(
+            f"val_viz/sample_{j}",
+            s["occ"],
+            s["start"],
+            s["goal"],
+            s["optimal"],
+            predicted_actions=pred,
+            step=epoch,
+            timeline="epoch",
+        )
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", required=True)
-    args = ap.parse_args()
-    cfg = yaml.safe_load(open(args.config))
+    cfg = yaml.safe_load(open(ap.parse_args().config))
     set_seed(cfg.get("seed", 0))
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    t, lg = cfg["training"], cfg["logging"]
-    size = cfg["data"]["grid_size"]
-    ddir = cfg["data"]["data_dir"]
-    os.makedirs(lg["checkpoint_dir"], exist_ok=True)
-    logger = CSVLogger(lg["log_dir"])
+    data, train, log = cfg["data"], cfg["training"], cfg["logging"]
+    size = data["grid_size"]
+    os.makedirs(log["checkpoint_dir"], exist_ok=True)
+    # Train metrics are per-step, val metrics are per-epoch — different schemas,
+    # so they go to separate CSVs. A single logger would lock its header to the
+    # first row's keys (the train row) and silently drop the val columns.
+    train_logger = CSVLogger(log["log_dir"], name="train_metrics")
+    val_logger = CSVLogger(log["log_dir"], name="val_metrics")
 
-    train_loader = make_loader(f"{ddir}_train.parquet", t["batch_size"], True, cfg["data"]["num_workers"])
-    val_loader = make_loader(f"{ddir}_val.parquet", t["batch_size"], False, cfg["data"]["num_workers"])
+    ddir = data["data_dir"]
+    train_loader = make_loader(
+        f"{ddir}_train.parquet", train["batch_size"], True, data["num_workers"]
+    )
+    val_loader = make_loader(
+        f"{ddir}_val.parquet", train["batch_size"], False, data["num_workers"]
+    )
+
+    # optionally fix a small set of val samples to watch in rerun each epoch (Phase 4)
+    n_viz = log.get("viz_samples", 0)
+    viz_samples = []
+    if n_viz > 0:
+        viz_samples = rerun_viz.load_viz_samples(f"{ddir}_val.parquet", n_viz)
+        rerun_viz.init("trm-train")
 
     model = build_model(cfg, device)
     print(f"params: {sum(p.numel() for p in model.parameters()):,}")
-    opt = AdamW(model.parameters(), lr=t["lr"], weight_decay=t["weight_decay"])
-    sched = CosineAnnealingLR(opt, T_max=t["num_epochs"])
-    ema = EMA(model, t["ema_decay"]) if t.get("use_ema", True) else None
+    optimizer = AdamW(
+        model.parameters(), lr=train["lr"], weight_decay=train["weight_decay"]
+    )
 
-    amp = t["mixed_precision"]
-    amp_dtype = {"bf16": torch.bfloat16, "fp16": torch.float16}.get(amp)
-    scaler = torch.amp.GradScaler(enabled=(amp == "fp16"))
-    accum = t["grad_accum_steps"]
+    ema = EMA(model, decay=train.get("ema_decay", 0.999))
+    scheduler = CosineAnnealingLR(optimizer, T_max=train["num_epochs"])
 
-    best_success, patience = -1.0, 0
-    for epoch in range(t["num_epochs"]):
+    best_success = -1.0
+    for epoch in range(train["num_epochs"]):
         model.train()
-        opt.zero_grad(set_to_none=True)
         for step, (grids, targets) in enumerate(train_loader):
             grids, targets = grids.to(device), targets.to(device)
-            with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=amp_dtype is not None):
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                 out = model(grids)
-                loss_dict = compute_trm_loss(out, targets, t.get("halt_loss_weight", 1.0))
-                loss = loss_dict["total_loss"] / accum
-            scaler.scale(loss).backward()
-            if (step + 1) % accum == 0:
-                scaler.unscale_(opt)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), t["grad_clip"])
-                scaler.step(opt); scaler.update(); opt.zero_grad(set_to_none=True)
-                if ema: ema.update()
-            if step % lg["log_every_n_steps"] == 0:
-                logger.log({"epoch": epoch, "step": step, "loss": loss_dict["total_loss"].item()})
-        sched.step()
+                result = compute_loss(
+                    out,
+                    targets,
+                    train.get("halt_loss_weight", 1.0),
+                    train.get("deep_supervision", True),
+                )
+            loss = result["total_loss"]
 
-        if ema: ema.apply_shadow()
+            optimizer.zero_grad()
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), train["grad_clip"])
+            optimizer.step()
+            ema.update()
+
+            if step % log["log_every_n_steps"] == 0:
+                train_logger.log(
+                    {
+                        "epoch": epoch,
+                        "step": step,
+                        "loss": loss.item(),
+                        "train_acc": result["final_acc"],
+                    }
+                )
+
+        scheduler.step()
+
+        # evaluate and optionally visualize on the smooth EMA weights
+        ema.apply_shadow()
         val = evaluate(model, val_loader, size, device)
-        if ema: ema.restore()
-        print(f"epoch {epoch+1}/{t['num_epochs']} | success {val['success_rate']:.3f} | "
-              f"opt {val['optimality_ratio']:.3f} | cellacc {val['per_cell_acc']:.3f}")
-        logger.log({"epoch": epoch, **{f"val_{k}": v for k, v in val.items()}})
+        if viz_samples:
+            _log_viz_epoch(model, viz_samples, epoch, device, size)
+        ema.restore()
+
+        print(
+            f"epoch {epoch + 1}/{train['num_epochs']} | success {val['success_rate']:.3f} | "
+            f"opt {val['optimality_ratio']:.3f} | cellacc {val['per_cell_acc']:.3f}"
+        )
+        val_logger.log({"epoch": epoch, **{f"val_{k}": v for k, v in val.items()}})
 
         if val["success_rate"] > best_success:
-            best_success = val["success_rate"]; patience = 0
-            sd = ema.shadow if ema else model.state_dict()
-            torch.save({"state_dict": sd, "config": cfg, "epoch": epoch},
-                       os.path.join(lg["checkpoint_dir"], "best.pt"))
-        else:
-            patience += 1
-            if patience >= t["early_stopping_patience"]:
-                print(f"early stopping at epoch {epoch+1}"); break
+            best_success = val["success_rate"]
+            # save the EMA weights as the checkpoint — they generalise better than live weights
+            torch.save(
+                {"state_dict": ema.shadow, "config": cfg, "epoch": epoch},
+                os.path.join(log["checkpoint_dir"], "best.pt"),
+            )
 
-    logger.close()
+    train_logger.close()
+    val_logger.close()
     print(f"best val success rate: {best_success:.3f}")
 
 

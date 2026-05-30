@@ -1,4 +1,5 @@
-# Main TRM config — tuned for RTX 5060 Mobile (8 GB VRAM)
+# Small/fast TRM variant — reduced width and reasoning depth for faster training.
+# dim 64, num_heads 4 (head_dim 48), n 4 => ~1.2M params (base is 4.82M).
 seed: 42
 
 data:
@@ -12,17 +13,17 @@ data:
 
 model:
   arch: trm # trm | cnn
-  dim: 128
-  num_heads: 8
+  dim: 64
+  num_heads: 4 # head_dim = 3*dim/num_heads = 48 (must be divisible by 4 for 2D RoPE)
   num_layers: 2
   num_classes: 5 # N, S, E, W, stay
   T: 3 # supervision steps (deep supervision)
-  n: 6 # reasoning recursions per supervision step
+  n: 4 # reasoning recursions per supervision step
   halting: true
 
 training:
-  batch_size: 8
-  num_epochs: 40
+  batch_size: 32
+  num_epochs: 10
   lr: 3.0e-4
   weight_decay: 0.01
   grad_clip: 1.0
@@ -31,7 +32,7 @@ training:
   ema_decay: 0.999 # EMA smoothing for evaluation and the saved checkpoint
 
 logging:
-  log_dir: logs/trm_base
-  checkpoint_dir: checkpoints/trm_base
+  log_dir: logs/trm_1m
+  checkpoint_dir: checkpoints/trm_1m
   log_every_n_steps: 50
   viz_samples: 5 # log this many fixed val samples to rerun each epoch (0 = off)

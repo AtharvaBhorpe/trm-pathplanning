@@ -52,7 +52,13 @@ def evaluate_batch(grids, preds, starts, goals, size):
     grids:  (B, L) input tokens (start/goal markers present)
     preds:  (B, L) predicted action ids
     starts/goals: (B,) flattened indices
-    Returns dict of aggregate metrics over the batch.
+
+    Returns raw per-batch counts so the caller can aggregate over the whole
+    dataset (averaging per-batch rates is biased when batches differ in size
+    or when a batch has zero successes):
+        n          : number of samples in the batch
+        successes  : number that reached the goal
+        opt_ratios : list of steps/optimal for each successful sample
     """
     b = grids.shape[0]
     successes, opt_ratios = 0, []
@@ -69,7 +75,4 @@ def evaluate_batch(grids, preds, starts, goals, size):
             opt = optimal_path_length(occ, s, g)
             if opt > 0:
                 opt_ratios.append(steps / opt)
-    return {
-        "success_rate": successes / b,
-        "optimality_ratio": float(np.mean(opt_ratios)) if opt_ratios else 0.0,
-    }
+    return {"n": b, "successes": successes, "opt_ratios": opt_ratios}

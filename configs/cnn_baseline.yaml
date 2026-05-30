@@ -1,0 +1,31 @@
+# CNN baseline — reference point the TRM must beat (esp. on generalization)
+seed: 42
+
+data:
+  grid_size: 26
+  obstacle_density: 0.25
+  num_train: 40000
+  num_val: 5000
+  num_test: 10000
+  data_dir: data/grids_26x26_d25
+  num_workers: 4
+
+model:
+  arch: cnn                # cnn | trm
+  dim: 64                  # embedding width fed into the conv stack
+  num_classes: 5           # N, S, E, W, stay
+
+training:
+  batch_size: 16
+  num_epochs: 40
+  lr: 1.0e-3
+  weight_decay: 0.01
+  grad_clip: 1.0
+  halt_loss_weight: 0.0    # the CNN has no halt head
+  deep_supervision: true
+  ema_decay: 0.999
+
+logging:
+  log_dir: logs/cnn_baseline
+  checkpoint_dir: checkpoints/cnn_baseline
+  log_every_n_steps: 50

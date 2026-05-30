@@ -1,4 +1,4 @@
-experiment_name: sanity
+# Tiny, fast config to check the pipeline runs end to end
 seed: 42
 
 data:
@@ -22,21 +22,16 @@ model:
 
 training:
   batch_size: 8
-  grad_accum_steps: 1
   num_epochs: 10
   lr: 1.0e-3
   weight_decay: 0.01
   grad_clip: 1.0
-  mixed_precision: bf16
-  gradient_checkpointing: false
-  ema_decay: 0.999
-  use_ema: false
   halt_loss_weight: 0.0
-  early_stopping_patience: 10
+  deep_supervision: true
+  ema_decay: 0.999
 
 logging:
   log_dir: logs/sanity
   checkpoint_dir: checkpoints/sanity
   log_every_n_steps: 50
-  eval_every_n_epochs: 1
-  rerun_viz: false
+  viz_samples: 5

@@ -41,6 +41,6 @@ class CNNBaseline(nn.Module):
 
 
 def build(cfg_model):
-    return CNNBaseline(dim=64,
+    return CNNBaseline(dim=cfg_model.get("dim", 64),
                        num_classes=cfg_model["num_classes"],
                        grid_size=cfg_model.get("grid_size", 26))

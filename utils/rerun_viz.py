@@ -1,14 +1,21 @@
 """
 Rerun visualization helpers.
 
-Rerun (https://rerun.io) is purpose-built for spatial/temporal robotics data.
+Rerun (https://rerun.io) is purpose-built for spatial/temporal data.
 We use it for three things:
-  1. Phase 1 — visually verify generated ground-truth paths.
-  2. Phase 4 — watch the predicted path converge toward optimal during training.
-  3. Phase 6 — capture striking generalization cases (TRM solves, CNN fails).
 
-Grids are logged as images; paths as 2D line strips; action fields as arrows.
+  Phase 1 — verify generated ground-truth paths:
+      build_dataset.py --visualize 20
+
+  Phase 4 — watch the predicted path converge toward optimal during training:
+      pretrain.py logs a fixed set of val samples each epoch when viz_samples > 0
+
+  Phase 6 — inspect model predictions on the test split:
+      uv run python -m scripts.eval_viz --config configs/base.yaml
+
+Grids are logged as images; paths as 2D line strips; success/failure as text logs.
 """
+
 import numpy as np
 
 try:
@@ -26,8 +33,9 @@ def _require_rerun():
 
 def init(app_id="trm-pathplanning", spawn=True):
     _require_rerun()
-    rr.init("app_id")
-    rr.spawn()
+    rr.init(app_id)
+    if spawn:
+        rr.spawn()
 
 
 def _grid_to_rgb(occ, start, goal):
@@ -40,7 +48,13 @@ def _grid_to_rgb(occ, start, goal):
     return img
 
 
-def _path_from_actions(occ, start, goal, action_field, max_steps=None):
+def path_from_actions(occ, start, goal, action_field, max_steps=None):
+    """
+    Trace a path from start by following action_field until the goal or a dead end.
+
+    Returns an (N, 2) float32 array of (x, y) centre-points in image space
+    (x = col + 0.5, y = row + 0.5) — the format rr.LineStrips2D expects.
+    """
     h, w = occ.shape
     max_steps = max_steps or h * w
     r, c = start
@@ -49,7 +63,7 @@ def _path_from_actions(occ, start, goal, action_field, max_steps=None):
         if (r, c) == goal:
             break
         a = int(action_field[r, c])
-        if a == 4:
+        if a == 4:  # STAY — reached goal or stuck
             break
         dr, dc = _MOVES[a]
         nr, nc = r + dr, c + dc
@@ -60,23 +74,96 @@ def _path_from_actions(occ, start, goal, action_field, max_steps=None):
     return np.array(pts, dtype=np.float32)
 
 
-def log_sample(name, occ, start, goal, optimal_actions, predicted_actions=None, step=None):
-    """Log one grid with its optimal (and optionally predicted) path."""
+def log_sample(
+    name,
+    occ,
+    start,
+    goal,
+    optimal_actions,
+    predicted_actions=None,
+    step=None,
+    timeline="sample",
+):
+    """
+    Log one grid with its optimal path (green) and optionally the predicted path (purple).
+
+    step / timeline: if step is given, set_time_sequence(timeline, step) so you can
+    scrub through samples (timeline="sample") or training epochs (timeline="epoch").
+    """
     _require_rerun()
     if step is not None:
-        rr.set_time_sequence("epoch", step)
+        rr.set_time(timeline, sequence=step)
+
     rr.log(f"{name}/grid", rr.Image(_grid_to_rgb(occ, start, goal)))
-    opt = _path_from_actions(occ, start, goal, optimal_actions)
-    rr.log(f"{name}/optimal_path", rr.LineStrips2D([opt], colors=[(110, 170, 120)]))
+
+    opt_pts = path_from_actions(occ, start, goal, optimal_actions)
+    rr.log(f"{name}/optimal_path", rr.LineStrips2D([opt_pts], colors=[(110, 170, 120)]))
+
     if predicted_actions is not None:
-        pred = _path_from_actions(occ, start, goal, predicted_actions)
-        rr.log(f"{name}/predicted_path", rr.LineStrips2D([pred], colors=[(155, 130, 194)]))
+        pred_pts = path_from_actions(occ, start, goal, predicted_actions)
+        rr.log(
+            f"{name}/predicted_path",
+            rr.LineStrips2D([pred_pts], colors=[(155, 130, 194)]),
+        )
+
+        # did the predicted path reach the goal?
+        goal_centre = np.array([goal[1] + 0.5, goal[0] + 0.5], dtype=np.float32)
+        success = len(pred_pts) > 0 and np.allclose(pred_pts[-1], goal_centre)
+        rr.log(
+            f"{name}/result",
+            rr.TextLog(
+                "SUCCESS" if success else "FAILED",
+                level=rr.TextLogLevel.INFO if success else rr.TextLogLevel.WARN,
+            ),
+        )
+
+
+def load_viz_samples(parquet_path, k):
+    """
+    Load k samples from a parquet file for training-time visualization.
+
+    Returns a list of dicts, each with:
+        occ          : (H, W) int8 occupancy grid (raw, no tokens injected)
+        optimal      : (H, W) int64 ground-truth action field
+        start, goal  : (row, col) tuples
+        grid_tokens  : (H*W,) int64 with START_TOKEN=2 / GOAL_TOKEN=3 injected
+                       — ready to be passed directly to the model
+    """
+    import pyarrow.parquet as pq
+
+    table = pq.read_table(parquet_path)
+    size = int(table["grid_size"][0].as_py())
+    n = min(k, table.num_rows)
+    samples = []
+    for i in range(n):
+        occ = np.array(table["grid_flat"][i].as_py(), dtype=np.int8).reshape(size, size)
+        optimal = np.array(table["actions_flat"][i].as_py(), dtype=np.int64).reshape(
+            size, size
+        )
+        si = int(table["start_idx"][i].as_py())
+        gi = int(table["goal_idx"][i].as_py())
+        start = (si // size, si % size)
+        goal = (gi // size, gi % size)
+        grid_tokens = np.array(table["grid_flat"][i].as_py(), dtype=np.int64)
+        grid_tokens[si] = 2  # START_TOKEN
+        grid_tokens[gi] = 3  # GOAL_TOKEN
+        samples.append(
+            {
+                "occ": occ,
+                "optimal": optimal,
+                "start": start,
+                "goal": goal,
+                "grid_tokens": grid_tokens,
+            }
+        )
+    return samples
 
 
 def preview_dataset(parquet_path, k):
-    """Load k samples from a parquet split and log them for inspection."""
-    import pyarrow.parquet as pq
+    """Load k samples from a parquet split and log them for inspection (Phase 1)."""
     _require_rerun()
+    import pyarrow.parquet as pq
+
     init()
     t = pq.read_table(parquet_path)
     size = int(t["grid_size"][0].as_py())

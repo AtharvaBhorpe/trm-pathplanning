@@ -1,2 +1,2 @@
-"""Training utilities: EMA, metrics, rerun visualization, logging."""
+"""Training utilities: metrics, rerun visualization, csv logging."""
 

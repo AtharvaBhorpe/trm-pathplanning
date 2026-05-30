@@ -1,2 +1,2 @@
-"""Evaluation and benchmarking entry points (run as modules from project root)."""
+"""Evaluation and visualization scripts (run as modules from the project root)."""
 
