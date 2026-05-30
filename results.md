@@ -4,7 +4,7 @@
 
 A **~1.2M-parameter** TRM (`configs/trm_1m.yaml`) reaches **100% path-success** with
 **perfectly optimal paths** on 26×26 grids at 25% obstacle density, converging by
-**epoch 6** (well under 10 minutes of training on an 8 GB RTX 5060 Mobile).
+**epoch 6** (~30 minutes of training on an 8 GB RTX 5060 Mobile).
 
 | Config | Params | Best val success | Optimality | Cell acc | Epochs to converge |
 |--------|-------:|-----------------:|-----------:|---------:|-------------------:|
@@ -16,7 +16,7 @@ A **~1.2M-parameter** TRM (`configs/trm_1m.yaml`) reaches **100% path-success** 
 - **Grid size:** 26×26 (`L = 676` cells)
 - **Obstacle density:** 25% (random, regenerated until start→goal is reachable)
 - **Splits:** 40k train / 5k val / 10k test, disjoint seeds
-- Ground-truth optimal action field per cell from BFS/Dijkstra (`dataset/solver.py`)
+- Ground-truth optimal action field per cell from BFS (`dataset/solver.py`)
 
 > ⚠️ The model is trained on a **single grid size and a single obstacle density**, so it
 > may be fitted to 26×26 @ 25%. Generalization is untested — see *Open work* below.
