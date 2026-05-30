@@ -154,6 +154,28 @@ Training logs to three places, all under `logs/<run>/`:
   In the viewer, scrub the **step** timeline for the training curves and the **epoch**
   timeline for the validation curves.
 
+### Plotting metrics offline (matplotlib)
+
+As a local, no-server alternative to the rerun viewer, `scripts/plot_metrics.py` renders
+the CSV logs into static figures — the **whole** training/val history at once (no
+follow-mode scrolling), saved as a PNG you can drop straight into `results.md`. Pass
+several runs to overlay and compare them (the one thing the live rerun view can't do well).
+
+```bash
+# single run (derive log_dir from a config, or point at it directly)
+uv run python -m scripts.plot_metrics --config configs/trm_1m.yaml
+uv run python -m scripts.plot_metrics --log-dir logs/trm_1m
+
+# overlay multiple runs for comparison
+uv run python -m scripts.plot_metrics --log-dir logs/trm_1m --log-dir logs/base
+
+# custom output path (default: <log_dir>/metrics.png)
+uv run python -m scripts.plot_metrics --config configs/trm_1m.yaml --out figs/trm_1m.png
+```
+
+Panels: train loss, train accuracy, val success-rate, optimality-ratio, per-cell-accuracy.
+(Learning rate is only streamed to rerun, not the CSVs, so it isn't plotted here.)
+
 Weights & Biases integration is planned but not yet wired in.
 
 ## Known limitations
