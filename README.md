@@ -110,6 +110,39 @@ uv run python -m scripts.eval_viz --config configs/trm_1m.yaml --checkpoint path
 The architecture is rebuilt from the config stored *inside* the checkpoint, so it
 always matches the trained weights.
 
+### 4. Baselines (A* + CNN)
+
+To put the TRM in context, compare it against a classical planner and two
+parameter-matched CNNs (`cnn_shallow`, `cnn_deep`). Train the CNNs on the same budget
+as `trm_1m`, then run the two comparison scripts:
+
+```bash
+# train the param-matched CNN baselines (~1.2M each, trm_1m budget)
+uv run python pretrain.py --config configs/cnn_shallow.yaml
+uv run python pretrain.py --config configs/cnn_deep.yaml
+
+# accuracy on the test split (A* oracle vs TRM vs CNNs)
+uv run python -m scripts.compare_baselines
+
+# latency / throughput across batch sizes and devices (bf16; add --compile to fuse)
+uv run python -m scripts.benchmark_latency
+
+# out-of-distribution sweeps over grid size and obstacle density
+uv run python -m scripts.eval_ood
+```
+
+- `dataset/astar.py` — a true A* planner (Manhattan heuristic, 4-connected, optimal by
+  construction); the latency oracle for the classical comparison.
+- `scripts/compare_baselines.py` — success / optimality / per-cell-acc on the test split,
+  reusing the training-time evaluator so the TRM numbers match its best checkpoint.
+- `scripts/benchmark_latency.py` — per-grid latency and throughput for A*, BFS, both CNNs,
+  and the TRM at batch sizes 1/8/64/512 on CPU and GPU.
+- `scripts/eval_ood.py` — out-of-distribution sweeps: success / optimality / per-cell-acc on
+  grid sizes and densities the models never trained on (the TRM runs at any size by rebuilding
+  its relative 2D-RoPE tables). Test grids are generated on demand and cached under `data/ood/`.
+
+See `results.md` for the recorded tables, the receptive-field analysis, and the OOD findings.
+
 ## Configs
 
 | Config | Params | Notes |
@@ -119,7 +152,9 @@ always matches the trained weights.
 | `sanity.yaml` | small | Fast pipeline smoke-test (T 1, n 2, 10 epochs). |
 | `ablation_n{1,3,12}.yaml` | varies | Sweep over reasoning recursions `n`. |
 | `ablation_no_deepsup.yaml` | — | Deep supervision turned off. |
-| `cnn_baseline.yaml` | — | Plain CNN baseline (`arch: cnn`). |
+| `cnn_shallow.yaml` | ~1.2M | CNN baseline, 4 conv layers (9×9 receptive field). |
+| `cnn_deep.yaml` | ~1.2M | CNN baseline, 13 conv layers (27×27 receptive field). |
+| `cnn_baseline.yaml` | — | Original plain CNN baseline (`arch: cnn`). |
 
 Key knobs: `model.{dim, num_heads, num_layers, T, n, halting}` and
 `training.{batch_size, lr, num_epochs, halt_loss_weight, deep_supervision, ema_decay}`.
@@ -180,6 +215,10 @@ Weights & Biases integration is planned but not yet wired in.
 
 ## Known limitations
 
-The released model is trained only on **26×26 grids at 25% obstacle density**, so it may
-be fitted to that grid size and density. Generalization to other sizes/densities is
-untested — see `results.md` for the open evaluation work.
+The released model is trained only on **26×26 grids at 25% obstacle density**. Out-of-
+distribution behaviour is now measured (`scripts/eval_ood.py`, see `results.md`): it
+generalizes across **obstacle density** essentially for free (≥0.99 success from 0.10 to
+0.40) and **extrapolates across grid size** markedly better than a param-matched CNN,
+holding up to ~1.5× the trained side (0.94 success at 32×32) before degrading at 40×40
+(0.52). Recovering large-grid success (e.g. via mixed-size training or more recursion) is
+the main open thread.
