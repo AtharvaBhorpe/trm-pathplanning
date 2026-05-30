@@ -183,9 +183,13 @@ def main():
     # optionally fix a small set of val samples to watch in rerun each epoch (Phase 4)
     n_viz = log.get("viz_samples", 0)
     viz_samples = []
-    if n_viz > 0:
+    use_rerun = n_viz > 0
+    if use_rerun:
         viz_samples = rerun_viz.load_viz_samples(f"{ddir}_val.parquet", n_viz)
-        rerun_viz.init("trm-train")
+        # save_path persists all graphs to a .rrd so they're viewable after training:
+        #   rerun logs/<run>/train.rrd
+        rerun_viz.init("trm-train", save_path=os.path.join(log["log_dir"], "train.rrd"))
+    steps_per_epoch = len(train_loader)  # for a monotonic global step on the rerun x-axis
 
     model = build_model(cfg, device)
     print(f"params: {sum(p.numel() for p in model.parameters()):,}")
@@ -226,6 +230,18 @@ def main():
                         "train_acc": result["final_acc"],
                     }
                 )
+                if use_rerun:
+                    # global step keeps the rerun x-axis monotonic across epochs;
+                    # lr is read here (before scheduler.step()) so it matches this step
+                    rerun_viz.log_scalars(
+                        {
+                            "train/loss": loss.item(),
+                            "train/acc": result["final_acc"],
+                            "train/lr": scheduler.get_last_lr()[0],
+                        },
+                        step=epoch * steps_per_epoch + step,
+                        timeline="step",
+                    )
 
         scheduler.step()
 
@@ -241,6 +257,10 @@ def main():
             f"opt {val['optimality_ratio']:.3f} | cellacc {val['per_cell_acc']:.3f}"
         )
         val_logger.log({"epoch": epoch, **{f"val_{k}": v for k, v in val.items()}})
+        if use_rerun:
+            rerun_viz.log_scalars(
+                {f"val/{k}": v for k, v in val.items()}, step=epoch, timeline="epoch"
+            )
 
         if val["success_rate"] > best_success:
             best_success = val["success_rate"]

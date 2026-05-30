@@ -93,6 +93,8 @@ Outputs:
 - `checkpoints/<run>/best.pt` — EMA weights + the config used + epoch
 - `logs/<run>/train_metrics.csv` — per-step `loss`, `train_acc`
 - `logs/<run>/val_metrics.csv` — per-epoch `success_rate`, `optimality_ratio`, `per_cell_acc`
+- `logs/<run>/train.rrd` — rerun recording of the live metric graphs + path viz (only
+  when `viz_samples > 0`); reopen anytime with `rerun logs/<run>/train.rrd`
 
 ### 3. Evaluate & visualize
 
@@ -133,8 +135,26 @@ Key knobs: `model.{dim, num_heads, num_layers, T, n, halting}` and
 
 ## Logging
 
-Training currently logs to CSV (`logs/<run>/`) and to the rerun viewer. Weights & Biases
-integration is planned but not yet wired in.
+Training logs to three places, all under `logs/<run>/`:
+
+- **CSV** — `train_metrics.csv` (per-step `loss`, `train_acc`) and `val_metrics.csv`
+  (per-epoch `success_rate`, `optimality_ratio`, `per_cell_acc`) for quick scripting/plotting.
+- **Rerun live graphs** — when `viz_samples > 0`, scalar metrics stream to the rerun viewer
+  as time-series so you can watch training in real time. Training curves (`train/loss`,
+  `train/acc`, `train/lr`) plot against a global-step timeline; validation curves
+  (`val/success_rate`, `val/optimality_ratio`, `val/per_cell_acc`) plot against an epoch
+  timeline. The same fixed val samples' predicted-vs-optimal paths are logged each epoch.
+- **Persistent `.rrd` recording** — the live stream is *also* saved to `logs/<run>/train.rrd`,
+  so the graphs survive after the run ends. Reopen them anytime (no retraining) with:
+
+  ```bash
+  rerun logs/<run>/train.rrd     # e.g. rerun logs/trm_1m/train.rrd
+  ```
+
+  In the viewer, scrub the **step** timeline for the training curves and the **epoch**
+  timeline for the validation curves.
+
+Weights & Biases integration is planned but not yet wired in.
 
 ## Known limitations
 

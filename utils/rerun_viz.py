@@ -7,8 +7,11 @@ We use it for three things:
   Phase 1 — verify generated ground-truth paths:
       build_dataset.py --visualize 20
 
-  Phase 4 — watch the predicted path converge toward optimal during training:
-      pretrain.py logs a fixed set of val samples each epoch when viz_samples > 0
+  Phase 4 — watch training live and review it afterwards:
+      pretrain.py streams scalar metric graphs (loss / acc / lr / val metrics) plus a
+      fixed set of predicted-vs-optimal val paths each epoch when viz_samples > 0, and
+      also saves everything to logs/<run>/train.rrd so the graphs survive the run
+      (reopen with: rerun logs/<run>/train.rrd)
 
   Phase 6 — inspect model predictions on the test split:
       uv run python -m scripts.eval_viz --config configs/base.yaml
@@ -31,11 +34,45 @@ def _require_rerun():
         raise ImportError("rerun-sdk not installed. Run: uv add rerun-sdk")
 
 
-def init(app_id="trm-pathplanning", spawn=True):
+def init(app_id="trm-pathplanning", spawn=True, save_path=None):
+    """
+    Start a rerun recording.
+
+    spawn      : open a live viewer window to watch the run in real time.
+    save_path  : if given, also persist everything to a `.rrd` file so the graphs
+                 survive after the run ends. Reopen later with: rerun <save_path>.
+
+    With both set, we stream live AND save to disk (rr.spawn(connect=False) launches
+    the viewer process without claiming the sink, then set_sinks tees to both).
+    """
     _require_rerun()
     rr.init(app_id)
-    if spawn:
+    if save_path:
+        import os
+
+        os.makedirs(os.path.dirname(os.path.abspath(save_path)), exist_ok=True)
+        sinks = [rr.FileSink(save_path)]
+        if spawn:
+            rr.spawn(connect=False)  # launch the viewer without grabbing the sink
+            sinks.append(rr.GrpcSink())  # ...then also stream to it live
+        rr.set_sinks(*sinks)
+    elif spawn:
         rr.spawn()
+
+
+def log_scalars(values: dict, step: int, timeline: str = "step"):
+    """
+    Stream training/eval metrics to rerun as scalar time-series (Phase 4).
+
+    values   : {entity_path: number}, e.g. {"train/loss": 0.24, "train/lr": 3e-4}.
+               Each key becomes its own line plot in the rerun viewer.
+    step      : x-axis position on `timeline` (global step for train, epoch for val).
+    timeline  : which timeline to plot against ("step" or "epoch").
+    """
+    _require_rerun()
+    rr.set_time(timeline, sequence=step)
+    for name, value in values.items():
+        rr.log(name, rr.Scalars(float(value)))
 
 
 def _grid_to_rgb(occ, start, goal):
